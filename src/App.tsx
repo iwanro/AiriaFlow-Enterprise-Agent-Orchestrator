@@ -28,49 +28,38 @@ import {
 import { TaskStatus, EnterpriseTask, AgentStep } from './types';
 import { analyzeTask, generateAgentAction } from './services/gemini';
 
-type ViewType = 'dashboard' | 'activity' | 'database' | 'settings';
-
-// --- Mock Initial Data ---
-const INITIAL_TASKS: EnterpriseTask[] = [
-  {
-    id: '1',
-    title: 'Customer Refund Request #8821',
-    description: 'Customer requesting full refund for damaged shipment of high-value electronics.',
-    priority: 'high',
-    status: TaskStatus.COMPLETED,
-    createdAt: new Date(Date.now() - 3600000).toISOString(),
-    steps: [
-      { id: 's1', agentName: 'TriageBot', action: 'Analyzing sentiment and urgency', status: 'done', timestamp: new Date(Date.now() - 3500000).toISOString() },
-      { id: 's2', agentName: 'LogisticsAgent', action: 'Checking shipping logs in ERP', status: 'done', timestamp: new Date(Date.now() - 3400000).toISOString() },
-      { id: 's3', agentName: 'FinanceAgent', action: 'Verifying payment status in Stripe', status: 'done', timestamp: new Date(Date.now() - 3300000).toISOString() },
-    ],
-    result: '### Analysis Summary\n- **Status**: Refund Processed\n- **Reason**: Verified shipping damage through ERP logs.\n- **Action**: $1,240.00 credited back to customer card.\n\n### Next Steps\n1. Notify customer via automated email.\n2. File insurance claim with FedEx using tracking #FX-9921.\n3. Update inventory status to "Damaged/Write-off".'
-  },
-  {
-    id: '2',
-    title: 'New Vendor Onboarding',
-    description: 'Process compliance documents for "Global Logistics Solutions Inc."',
-    priority: 'medium',
-    status: TaskStatus.AWAITING_APPROVAL,
-    createdAt: new Date(Date.now() - 1800000).toISOString(),
-    steps: [
-      { id: 's4', agentName: 'ComplianceBot', action: 'Scanning documents for risk factors', status: 'done', timestamp: new Date(Date.now() - 1700000).toISOString() },
-      { id: 's5', agentName: 'LegalAgent', action: 'Drafting MSA based on standard template', status: 'done', timestamp: new Date(Date.now() - 1600000).toISOString() },
-      { id: 's6', agentName: 'Human-in-the-Loop', action: 'Final contract approval', status: 'working', timestamp: new Date(Date.now() - 1500000).toISOString() },
-    ]
-  }
-];
+type ViewType = 'dashboard' | 'activity' | 'database' | 'settings' | 'info';
 
 export default function App() {
   const [currentView, setCurrentView] = useState<ViewType>('activity');
-  const [tasks, setTasks] = useState<EnterpriseTask[]>(INITIAL_TASKS);
-  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(INITIAL_TASKS[0].id);
+  const [tasks, setTasks] = useState<EnterpriseTask[]>([]);
+  const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [newTaskDesc, setNewTaskDesc] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [copied, setCopied] = useState(false);
 
   const selectedTask = tasks.find(t => t.id === selectedTaskId);
+
+  // --- Real-time Sync ---
+  const fetchTasks = async () => {
+    try {
+      const res = await fetch('/api/tasks');
+      const data = await res.json();
+      setTasks(data);
+      if (!selectedTaskId && data.length > 0) {
+        setSelectedTaskId(data[0].id);
+      }
+    } catch (err) {
+      console.error("Failed to fetch tasks", err);
+    }
+  };
+
+  useEffect(() => {
+    fetchTasks();
+    const interval = setInterval(fetchTasks, 3000); // Poll every 3s for "live" feel
+    return () => clearInterval(interval);
+  }, [selectedTaskId]);
 
   const handleCopy = (text: string) => {
     navigator.clipboard.writeText(text);
@@ -106,62 +95,103 @@ export default function App() {
       steps: []
     };
 
-    setTasks([newTask, ...tasks]);
-    setSelectedTaskId(id);
-    setIsCreating(false);
-    setNewTaskDesc('');
-
     try {
+      // Save to real DB
+      await fetch('/api/tasks', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(newTask)
+      });
+
+      setTasks([newTask, ...tasks]);
+      setSelectedTaskId(id);
+      setIsCreating(false);
+      setNewTaskDesc('');
+
       const analysis = await analyzeTask(newTaskDesc);
       
-      setTasks(prev => prev.map(t => t.id === id ? {
-        ...t,
-        status: TaskStatus.GATHERING_DATA,
-        steps: analysis.suggestedSteps.map((s, i) => ({
-          id: `step-${id}-${i}`,
-          agentName: i === 0 ? 'TriageBot' : 'SystemAgent',
-          action: s,
-          status: 'idle',
-          timestamp: new Date().toISOString()
-        }))
-      } : t));
+      // Update status to Gathering
+      await fetch(`/api/tasks/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: TaskStatus.GATHERING_DATA })
+      });
 
-      for (let i = 0; i < analysis.suggestedSteps.length; i++) {
-        const currentStep = analysis.suggestedSteps[i];
-        setTasks(prev => prev.map(t => t.id === id ? {
-          ...t,
-          steps: t.steps.map((s, idx) => idx === i ? { ...s, status: 'working' } : s)
-        } : t));
+      // Create steps in DB
+      const steps = analysis.suggestedSteps.map((s, i) => ({
+        id: `step-${id}-${i}`,
+        agentName: i === 0 ? 'TriageBot' : 'ResearchAgent',
+        action: s,
+        status: 'idle',
+        timestamp: new Date().toISOString()
+      }));
 
-        const result = await generateAgentAction(currentStep, newTaskDesc);
-        await new Promise(r => setTimeout(r, 1500));
-
-        setTasks(prev => prev.map(t => t.id === id ? {
-          ...t,
-          steps: t.steps.map((s, idx) => idx === i ? { ...s, status: 'done', details: result } : s)
-        } : t));
+      for (const step of steps) {
+        await fetch(`/api/tasks/${id}/steps`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(step)
+        });
       }
 
-      setTasks(prev => prev.map(t => t.id === id ? {
-        ...t,
-        status: analysis.requiresApproval ? TaskStatus.AWAITING_APPROVAL : TaskStatus.COMPLETED,
-        result: analysis.requiresApproval ? undefined : `### Workflow Summary\n- **Analysis**: ${analysis.analysis}\n- **Outcome**: Successfully orchestrated ${analysis.suggestedSteps.length} agent actions.\n\n### Detailed Findings\n${analysis.suggestedSteps.map(s => `- Action "${s}" completed without errors.`).join('\n')}`
-      } : t));
+      // Execute steps
+      for (let i = 0; i < steps.length; i++) {
+        const step = steps[i];
+        
+        await fetch(`/api/steps/${step.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'working' })
+        });
+
+        const result = await generateAgentAction(step.action, newTaskDesc);
+
+        await fetch(`/api/steps/${step.id}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ status: 'done', details: result })
+        });
+      }
+
+      // Finalize
+      const finalResult = analysis.requiresApproval ? undefined : `### Workflow Summary\n- **Analysis**: ${analysis.analysis}\n- **Outcome**: Successfully orchestrated ${analysis.suggestedSteps.length} agent actions.\n\n### Detailed Findings\n${analysis.suggestedSteps.map(s => `- Action "${s}" completed without errors.`).join('\n')}`;
+      
+      await fetch(`/api/tasks/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          status: analysis.requiresApproval ? TaskStatus.AWAITING_APPROVAL : TaskStatus.COMPLETED,
+          result: finalResult
+        })
+      });
 
     } catch (err) {
       console.error(err);
-      setTasks(prev => prev.map(t => t.id === id ? { ...t, status: TaskStatus.FAILED } : t));
+      await fetch(`/api/tasks/${id}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ status: TaskStatus.FAILED })
+      });
     } finally {
       setIsProcessing(false);
+      fetchTasks();
     }
   };
 
-  const handleApprove = (taskId: string) => {
-    setTasks(prev => prev.map(t => t.id === taskId ? {
-      ...t,
-      status: TaskStatus.COMPLETED,
-      result: '### Human Approval Granted\n- **Operator**: ffffdv@gmail.com\n- **Action**: Final deployment authorized.\n\n### System Update\nAll pending agent actions have been committed to the production environment. Compliance logs updated.'
-    } : t));
+  const handleApprove = async (taskId: string) => {
+    try {
+      await fetch(`/api/tasks/${taskId}`, {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ 
+          status: TaskStatus.COMPLETED,
+          result: '### Human Approval Granted\n- **Operator**: ffffdv@gmail.com\n- **Action**: Final deployment authorized.\n\n### System Update\nAll pending agent actions have been committed to the production environment. Compliance logs updated.'
+        })
+      });
+      fetchTasks();
+    } catch (err) {
+      console.error(err);
+    }
   };
 
   const renderView = () => {
@@ -172,6 +202,8 @@ export default function App() {
         return <DatabaseView />;
       case 'settings':
         return <SettingsView />;
+      case 'info':
+        return <ProjectInfoView />;
       case 'activity':
       default:
         return (
@@ -400,9 +432,16 @@ export default function App() {
             active={currentView === 'settings'} 
             onClick={() => setCurrentView('settings')} 
           />
+          <NavItem 
+            icon={HelpCircle} 
+            active={currentView === 'info'} 
+            onClick={() => setCurrentView('info')} 
+          />
         </div>
         <div className="mt-auto">
-          <HelpCircle className="w-6 h-6 text-zinc-600 cursor-pointer hover:text-white transition-colors" />
+          <div className="w-8 h-8 rounded-full bg-white/10 flex items-center justify-center text-[10px] font-bold text-zinc-400">
+            FD
+          </div>
         </div>
       </nav>
 
@@ -622,6 +661,61 @@ function SettingsView() {
             </button>
           </div>
         </section>
+      </div>
+    </div>
+  );
+}
+
+function ProjectInfoView() {
+  const sections = [
+    {
+      title: "Problem Statement",
+      content: "Enterprises struggle with fragmented workflows across multiple legacy and SaaS systems. Manual context-switching leads to errors, delays, and high operational costs."
+    },
+    {
+      title: "Solution Overview",
+      content: "AiriaFlow is a multi-agent orchestration platform that uses LLMs to decompose complex tasks into specialized agent actions. It automates cross-system data gathering and execution while ensuring human oversight for critical decisions."
+    },
+    {
+      title: "Key Features",
+      content: "• Autonomous Task Decomposition\n• Multi-Agent Pipeline Execution\n• Human-in-the-Loop Approval Workflows\n• Real-time Orchestration Monitoring\n• Automated Report Generation"
+    },
+    {
+      title: "Technologies Used",
+      content: "• Gemini 3 Flash (Reasoning Engine)\n• React 19 & TypeScript\n• Tailwind CSS 4\n• Motion (Animations)\n• Lucide Icons"
+    },
+    {
+      title: "Target Users",
+      content: "Operations Managers, Compliance Officers, and Enterprise IT Teams looking to automate complex, multi-step business processes."
+    }
+  ];
+
+  return (
+    <div className="p-8 flex-1 max-w-3xl mx-auto w-full overflow-y-auto">
+      <div className="flex items-center gap-4 mb-8">
+        <div className="w-12 h-12 bg-emerald-500 rounded-2xl flex items-center justify-center shadow-lg shadow-emerald-500/20">
+          <Zap className="text-black w-7 h-7" />
+        </div>
+        <div>
+          <h1 className="text-3xl font-bold">AiriaFlow</h1>
+          <p className="text-zinc-500 text-sm">Hackathon Submission Details</p>
+        </div>
+      </div>
+
+      <div className="grid gap-6">
+        {sections.map((section) => (
+          <div key={section.title} className="bg-white/5 border border-white/5 p-6 rounded-3xl">
+            <h3 className="text-xs font-bold uppercase tracking-widest text-emerald-500 mb-3">{section.title}</h3>
+            <p className="text-zinc-300 whitespace-pre-line leading-relaxed">{section.content}</p>
+          </div>
+        ))}
+      </div>
+
+      <div className="mt-12 p-6 border border-dashed border-white/10 rounded-3xl bg-white/2">
+        <h3 className="text-sm font-bold mb-2">💡 Submission Tip</h3>
+        <p className="text-xs text-zinc-500 leading-relaxed">
+          Use the information above to complete your DevPost submission. Ensure you include the Community URL and your demo video link to be eligible for prizes!
+        </p>
       </div>
     </div>
   );
